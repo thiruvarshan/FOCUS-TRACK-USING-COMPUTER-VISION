@@ -1,0 +1,439 @@
+import cv2
+import dlib
+import time
+import tkinter as tk
+from tkinter import Button, Label, Scale
+import threading
+import os
+import numpy as np
+from imutils import face_utils
+import openpyxl
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.worksheet.hyperlink import Hyperlink
+from moviepy.editor import VideoFileClip
+from moviepy.video.io.ffmpeg_tools import ffmpeg_extract_subclip
+from ultralytics import YOLO
+
+# Global variables
+cap = None
+running = False
+recording = False
+out = None
+distraction_out = None
+start_time = 0
+focus_time = 0
+distraction_time = 0
+last_update_time = 0
+is_focused = False
+blink_count = 0
+ear_below_thresh = False
+playback_speed = 1.0
+gaze_not_focused_start = 0
+GAZE_FOCUS_THRESHOLD = 10
+multiple_faces_detected = False
+max_faces_detected = 0
+
+# Initialize dlib's face detector and the facial landmark predictor
+detector = dlib.get_frontal_face_detector()
+predictor = dlib.shape_predictor(r"C:\\Users\\kirut\\Downloads\shape_predictor_68_face_landmarks (1).dat")
+
+# Initialize YOLOv8 model
+yolo_model = YOLO('yolov8n.pt')
+
+def format_time(seconds):
+    hrs = int(seconds // 3600)
+    mins = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    return f"{hrs:02}:{mins:02}:{secs:02}"
+
+def start_camera_thread():
+    global cap, running
+    if not running:
+        running = True
+        threading.Thread(target=start_camera).start()
+
+def detect_eyes_and_gaze(frame, shape):
+    global blink_count, ear_below_thresh, gaze_not_focused_start, is_focused
+
+    left_eye = shape[36:42]
+    right_eye = shape[42:48]
+
+    def eye_aspect_ratio(eye):
+        A = np.linalg.norm(eye[1] - eye[5])
+        B = np.linalg.norm(eye[2] - eye[4])
+        C = np.linalg.norm(eye[0] - eye[3])
+        return (A + B) / (2.0 * C)
+
+    left_ear = eye_aspect_ratio(left_eye)
+    right_ear = eye_aspect_ratio(right_eye)
+
+    EAR_THRESHOLD = 0.2
+    eyes_open = left_ear > EAR_THRESHOLD and right_ear > EAR_THRESHOLD
+
+    if not eyes_open and not ear_below_thresh:
+        blink_count += 1
+        ear_below_thresh = True
+    elif eyes_open and ear_below_thresh:
+        ear_below_thresh = False
+
+    cv2.drawContours(frame, [cv2.convexHull(left_eye)], -1, (0, 255, 0), 1)
+    cv2.drawContours(frame, [cv2.convexHull(right_eye)], -1, (0, 255, 0), 1)
+
+    def detect_gaze(eye):
+        eye_center = np.mean(eye, axis=0).astype("int")
+        eye_left = eye[0]
+        eye_right = eye[3]
+
+        iris_pos = (eye[1] + eye[2] + eye[4] + eye[5]) / 4 - eye_left
+        eye_width = eye_right - eye_left
+        iris_ratio = iris_pos / eye_width
+
+        gaze_centered = 0.45 < iris_ratio[0] < 0.55
+
+        return gaze_centered
+
+    gaze_focused = False
+    if eyes_open:
+        left_gaze_focused = detect_gaze(left_eye)
+        right_gaze_focused = detect_gaze(right_eye)
+        gaze_focused = left_gaze_focused and right_gaze_focused
+
+    current_time = time.time()
+    if not gaze_focused:
+        if gaze_not_focused_start == 0:
+            gaze_not_focused_start = current_time
+        elif current_time - gaze_not_focused_start > GAZE_FOCUS_THRESHOLD:
+            is_focused = False
+    else:
+        gaze_not_focused_start = 0
+
+    return eyes_open and gaze_focused
+
+def detect_multiple_faces_eyes_gaze(frame):
+    global multiple_faces_detected, max_faces_detected
+
+    results = yolo_model(frame)
+
+    faces_data = []
+    person_count = 0
+
+    for result in results:
+        boxes = result.boxes.cpu().numpy()
+        for box in boxes:
+            if box.cls == 0:  # Class 0 is typically 'person' in COCO dataset
+                person_count += 1
+                x1, y1, x2, y2 = box.xyxy[0].astype(int)
+
+                face_region = frame[y1:y2, x1:x2]
+
+                gray_face = cv2.cvtColor(face_region, cv2.COLOR_BGR2GRAY)
+                dlib_faces = detector(gray_face)
+
+                for dlib_face in dlib_faces:
+                    shape = predictor(gray_face, dlib_face)
+                    shape = face_utils.shape_to_np(shape)
+
+                    shape += np.array([x1, y1])
+
+                    eyes_and_gaze_focused = detect_eyes_and_gaze(frame, shape)
+
+                    faces_data.append((box, eyes_and_gaze_focused))
+
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+    if person_count > 1:
+        multiple_faces_detected = True
+    max_faces_detected = max(max_faces_detected, person_count)
+
+    return faces_data
+
+def start_camera():
+    global cap, running, start_time, focus_time, distraction_time, last_update_time, is_focused, out, distraction_out, recording
+    cap = cv2.VideoCapture(0)
+
+    if not cap.isOpened():
+        print("Error: Camera could not be opened.")
+        running = False
+        return
+
+    start_time = time.time()
+    last_update_time = start_time
+    focus_time = 0
+    distraction_time = 0
+    is_focused = False
+
+    while running:
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to grab frame")
+            break
+
+        current_time = time.time()
+        faces_data = detect_multiple_faces_eyes_gaze(frame)
+
+        time_elapsed = current_time - last_update_time
+        if faces_data:
+            any_face_focused = any(eyes_and_gaze_focused for _, eyes_and_gaze_focused in faces_data)
+            if any_face_focused:
+                if not is_focused:
+                    is_focused = True
+                focus_time += time_elapsed
+                cv2.putText(frame, "Focused", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                if recording and out is not None:
+                    out.write(frame)
+            else:
+                if is_focused:
+                    is_focused = False
+                distraction_time += time_elapsed
+                cv2.putText(frame, "Distracted", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                if recording and distraction_out is not None:
+                    distraction_out.write(frame)
+        else:
+            if is_focused:
+                is_focused = False
+            distraction_time += time_elapsed
+            cv2.putText(frame, "No faces detected", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            if recording and distraction_out is not None:
+                distraction_out.write(frame)
+
+        last_update_time = current_time
+
+        cv2.putText(frame, f"Faces detected: {len(faces_data)}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+        cv2.imshow('Camera Feed', frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    if out is not None:
+        out.release()
+    if distraction_out is not None:
+        distraction_out.release()
+    cv2.destroyAllWindows()
+
+def stop_camera():
+    global running, recording
+    running = False
+    if recording:
+        stop_recording()
+    save_to_excel()
+
+def start_recording():
+    global recording, out, distraction_out, cap, playback_speed
+    if not recording and cap is not None:
+        recording = True
+        downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+        video_path = os.path.join(downloads_dir, "focus_video.mp4")
+        distraction_video_path = os.path.join(downloads_dir, "distraction_video.mp4")
+
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+
+        out = cv2.VideoWriter(video_path, fourcc, fps, (frame_width, frame_height))
+        distraction_out = cv2.VideoWriter(distraction_video_path, fourcc, fps, (frame_width, frame_height))
+
+        print(f"Recording started with playback speed: {playback_speed}x")
+
+def stop_recording():
+    global recording, out, distraction_out
+    if recording:
+        recording = False
+        if out is not None:
+            out.release()
+            print("Focus video saved in the Downloads folder")
+            out = None
+        if distraction_out is not None:
+            distraction_out.release()
+            print("Distraction video saved in the Downloads folder")
+            distraction_out = None
+
+def update_timer():
+    global focus_time, distraction_time, blink_count
+    if running:
+        current_time = time.time()
+        total_time = focus_time + distraction_time
+        if total_time > 0:
+            distraction_percentage = (distraction_time / total_time) * 100
+        else:
+            distraction_percentage = 0
+
+        timer_label.config(text=f"Elapsed Time: {format_time(total_time)}")
+        focus_time_label.config(text=f"Focus Time: {format_time(focus_time)}")
+        distraction_time_label.config(text=f"Distraction Time: {format_time(distraction_time)}")
+        distraction_percentage_label.config(text=f"Distraction %: {distraction_percentage:.2f}%")
+        blink_count_label.config(text=f"Blink Count: {blink_count}")
+
+        if distraction_percentage > 40:
+            warning_label.config(text=f"Warning: Distraction is {distraction_percentage:.2f}%!")
+        else:
+            warning_label.config(text="")
+
+    root.after(1000, update_timer)
+
+def update_playback_speed(value):
+    global playback_speed
+    playback_speed = float(value)
+    speed_label.config(text=f"Playback Speed: {playback_speed:.1f}x")
+
+def extract_video_segment(input_path, output_path, start_time, end_time):
+    ffmpeg_extract_subclip(input_path, start_time, end_time, targetname=output_path)
+
+def get_video_duration(video_path):
+    clip = VideoFileClip(video_path)
+    duration = clip.duration
+    clip.close()
+    return duration
+
+def create_distraction_segments(distraction_video_path, segment_duration=8):
+    total_duration = get_video_duration(distraction_video_path)
+    downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+
+    segments = []
+    for start_time in range(0, int(total_duration), segment_duration):
+        end_time = min(start_time + segment_duration, total_duration)
+        segment_path = os.path.join(downloads_dir, f"distraction_segment_{start_time}_{end_time}.mp4")
+        extract_video_segment(distraction_video_path, segment_path, start_time, end_time)
+        segments.append((segment_path, start_time, end_time))
+        print(f"Created segment: {segment_path}")
+
+    return segments
+
+def save_to_excel():
+    global focus_time, distraction_time, multiple_faces_detected, max_faces_detected, blink_count
+
+    wb = openpyxl.Workbook()
+    sheet = wb.active
+    sheet.title = "Focus Tracker Results"
+
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF")
+    border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+
+    headers = ["Metric", "Time (hh:mm:ss)", "Percentage", "Status", "Video Link", "Distraction Segments"]
+    for col, header in enumerate(headers, start=1):
+        cell = sheet.cell(row=1, column=col)
+        cell.value = header
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.border = border
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    total_time = focus_time + distraction_time
+    focus_percentage = (focus_time / total_time) * 100 if total_time > 0 else 0
+    distraction_percentage = (distraction_time / total_time) * 100 if total_time > 0 else 0
+
+    status = "Disqualified" if distraction_percentage > 40 else "Qualified"
+
+    downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+    focus_video_path = os.path.join(downloads_dir, "focus_video.mp4")
+    distraction_video_path = os.path.join(downloads_dir, "distraction_video.mp4")
+
+    distraction_segments = create_distraction_segments(distraction_video_path)
+
+    data = [
+        ("Total Time", format_time(total_time), "100%", "", ""),
+        ("Focus Time", format_time(focus_time), f"{focus_percentage:.2f}%", "", focus_video_path),
+        ("Distraction Time", format_time(distraction_time), f"{distraction_percentage:.2f}%", status, distraction_video_path),
+        ("Multiple Faces Detected", "Yes" if multiple_faces_detected else "No", "", "", ""),
+        ("Max Faces Detected", str(max_faces_detected), "", "", ""),
+        ("Blink Count", str(blink_count), "", "", "")
+    ]
+
+    for row, (metric, time, percentage, status, video_path) in enumerate(data, start=2):
+        sheet.cell(row=row, column=1, value=metric).border = border
+        sheet.cell(row=row, column=2, value=time).border = border
+        sheet.cell(row=row, column=3, value=percentage).border = border
+
+        status_cell = sheet.cell(row=row, column=4, value=status)
+        status_cell.border = border
+        if status == "Disqualified":
+            status_cell.fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+            status_cell.font = Font(color="FFFFFF")
+        elif status == "Qualified":
+            status_cell.fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")
+
+        if video_path:
+            cell = sheet.cell(row=row, column=5)
+            cell.value = "Click to open video"
+            cell.hyperlink = Hyperlink(ref=f"file://{video_path}", target=video_path, tooltip="Open video")
+            cell.font = Font(color="0000FF", underline="single")
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = border
+
+    for i, (segment_path, start_time, end_time) in enumerate(distraction_segments, start=1):
+        row = sheet.max_row + 1
+        sheet.cell(row=row, column=1, value=f"Distraction Segment {i}").border = border
+        sheet.cell(row=row, column=2, value=f"{format_time(start_time)} - {format_time(end_time)}").border = border
+
+        cell = sheet.cell(row=row, column=6)
+        cell.value = "Click to open segment"
+        cell.hyperlink = Hyperlink(ref=f"file://{segment_path}", target=segment_path, tooltip="Open segment")
+        cell.font = Font(color="0000FF", underline="single")
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border
+
+    for column in sheet.columns:
+        max_length = 0
+        column_letter = column[0].column_letter
+        for cell in column:
+            try:
+                if len(str(cell.value)) > max_length:
+                    max_length = len(cell.value)
+            except:
+                pass
+        adjusted_width = (max_length + 2)
+        sheet.column_dimensions[column_letter].width = adjusted_width
+
+    excel_path = os.path.join(downloads_dir, "focus_tracker_results.xlsx")
+    wb.save(excel_path)
+    print(f"Results saved to {excel_path}")
+
+# Create the GUI
+root = tk.Tk()
+root.title("Focus and Distraction Time Tracker")
+
+start_button = Button(root, text="Start Camera", command=start_camera_thread)
+start_button.pack()
+
+stop_button = Button(root, text="Stop Camera", command=stop_camera)
+stop_button.pack()
+
+record_button = Button(root, text="Start Recording", command=start_recording)
+record_button.pack()
+
+stop_record_button = Button(root, text="Stop Recording", command=stop_recording)
+stop_record_button.pack()
+
+speed_label = Label(root, text="Playback Speed: 1.0x")
+speed_label.pack()
+
+speed_slider = Scale(root, from_=0.1, to=2.0, resolution=0.1, orient=tk.HORIZONTAL, command=update_playback_speed, length=200)
+speed_slider.set(1.0)
+speed_slider.pack()
+
+timer_label = Label(root, text="Elapsed Time: 00:00:00")
+timer_label.pack()
+
+focus_time_label = Label(root, text="Focus Time: 00:00:00")
+focus_time_label.pack()
+
+distraction_time_label = Label(root, text="Distraction Time: 00:00:00")
+distraction_time_label.pack()
+
+distraction_percentage_label = Label(root, text="Distraction %: 0.00%")
+distraction_percentage_label.pack()
+
+blink_count_label = Label(root, text="Blink Count: 0")
+blink_count_label.pack()
+
+warning_label = Label(root, text="", fg="red")
+warning_label.pack()
+
+# Start updating the timer
+update_timer()
+
+# Start the GUI main loop
+root.mainloop()
